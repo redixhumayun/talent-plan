@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use crate::msg::{
     CommitRequest, CommitResponse, GetRequest, GetResponse, PrewriteRequest, PrewriteResponse,
     TimestampRequest, TimestampResponse,

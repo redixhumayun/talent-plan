@@ -1,10 +1,37 @@
+use core::fmt;
 use std::collections::BTreeMap;
+use std::sync::atomic::{self, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::msg::*;
 use crate::service::*;
 use crate::*;
+
+#[derive(Debug)]
+enum ServerError {
+    AlreadyLocked(Vec<u8>),
+    NewerVersionAvailable(Vec<u8>),
+}
+
+impl fmt::Display for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            ServerError::AlreadyLocked(ref key) => write!(
+                f,
+                "The key {} is already locked ",
+                String::from_utf8_lossy(key)
+            ),
+            ServerError::NewerVersionAvailable(ref key) => write!(
+                f,
+                "The key {} has a newer version available",
+                String::from_utf8_lossy(key)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ServerError {}
 
 // TTL is used for a lock key.
 // If the key's lifetime exceeds this value, it should be cleaned up.
@@ -14,14 +41,20 @@ const TTL: u64 = Duration::from_millis(100).as_nanos() as u64;
 #[derive(Clone, Default)]
 pub struct TimestampOracle {
     // You definitions here if needed.
+    counter: Arc<Mutex<AtomicU64>>,
 }
 
 #[async_trait::async_trait]
 impl timestamp::Service for TimestampOracle {
-    // example get_timestamp RPC handler.
     async fn get_timestamp(&self, _: TimestampRequest) -> labrpc::Result<TimestampResponse> {
-        // Your code here.
-        unimplemented!()
+        let counter_guard = self
+            .counter
+            .lock()
+            .expect("error while acquiring lock on timestamp counter");
+        let old_value = counter_guard.fetch_add(1, atomic::Ordering::SeqCst);
+        Ok(TimestampResponse {
+            timestamp: old_value,
+        })
     }
 }
 
@@ -99,8 +132,14 @@ impl transaction::Service for MemoryStorage {
 
     // example prewrite RPC handler.
     async fn prewrite(&self, req: PrewriteRequest) -> labrpc::Result<PrewriteResponse> {
-        // Your code here.
-        unimplemented!()
+        self.acquire_locks(req.kv_pairs, req.timestamp)
+            .map_err(|e| {
+                labrpc::Error::Other(format!(
+                    "error while acquiring locks during prewrite: {}",
+                    e
+                ))
+            })?;
+        Ok(PrewriteResponse { res: true })
     }
 
     // example commit RPC handler.
@@ -114,5 +153,35 @@ impl MemoryStorage {
     fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
         // Your code here.
         unimplemented!()
+    }
+
+    /// This method will attempt to acquire a lock on each row and insert the data into the data column
+    fn acquire_locks(&self, kv_pairs: Vec<KvPair>, start_ts: u64) -> Result<(), ServerError> {
+        let mut primary_lock = None;
+        for pair in kv_pairs.into_iter() {
+            let mut storage = self.data.lock().unwrap();
+            let is_locked = storage.read(pair.key.clone(), Column::Lock, Some(start_ts), None);
+            if is_locked.is_some() {
+                self.back_off_maybe_clean_up_lock(start_ts, pair.key.clone());
+                return Err(ServerError::AlreadyLocked(pair.key));
+            }
+            storage.write(
+                pair.key.clone(),
+                Column::Lock,
+                start_ts,
+                Value::Timestamp(start_ts),
+            );
+            if primary_lock.is_none() {
+                primary_lock = Some(pair.key.clone());
+            }
+            let is_newer_version_available =
+                storage.read(pair.key.clone(), Column::Data, Some(start_ts), None);
+            if is_newer_version_available.is_some() {
+                self.back_off_maybe_clean_up_lock(start_ts, pair.key.clone());
+                return Err(ServerError::NewerVersionAvailable(pair.key));
+            }
+            storage.write(pair.key, Column::Data, start_ts, Value::Vector(pair.value));
+        }
+        Ok(())
     }
 }

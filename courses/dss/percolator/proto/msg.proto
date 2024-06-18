@@ -13,15 +13,27 @@ package msg;
 
 message TimestampRequest {}
 
-message TimestampResponse {}
+message TimestampResponse {
+    uint64 timestamp = 1;
+}
 
 message GetRequest {}
 
 message GetResponse {}
 
-message PrewriteRequest {}
+message KVPair {
+    bytes key = 1;
+    bytes value = 2;
+}
 
-message PrewriteResponse {}
+message PrewriteRequest {
+    uint64 timestamp = 1;
+    repeated KVPair kv_pairs = 2;
+}
+
+message PrewriteResponse {
+    bool res = 1;
+}
 
 message CommitRequest {
     bool is_primary = 1;
