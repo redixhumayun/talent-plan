@@ -4,7 +4,7 @@ use futures::executor;
 use labrpc::*;
 
 use crate::{
-    msg::TimestampRequest,
+    msg::{CommitRequest, KvPair, PrewriteRequest, TimestampRequest},
     service::{TSOClient, TransactionClient},
 };
 
@@ -64,23 +64,11 @@ impl Client {
 
     /// Gets a timestamp from a TSO.
     pub fn get_timestamp(&self) -> Result<u64> {
-        let mut attempts = 0;
-        let mut delay = Duration::from_millis(BACKOFF_TIME_MS);
-
-        let mut get_ts = || loop {
-            match executor::block_on(self.tso_client.get_timestamp(&TimestampRequest {})) {
-                Ok(ts) => return Ok(ts.timestamp),
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= RETRY_TIMES {
-                        return Err(e);
-                    }
-                    std::thread::sleep(delay);
-                    delay = delay * 2;
-                }
-            }
-        };
-        get_ts()
+        let rpc = || self.tso_client.get_timestamp(&TimestampRequest {});
+        match executor::block_on(self.call_with_retry(rpc)) {
+            Ok(ts) => Ok(ts.timestamp),
+            Err(e) => Err(e),
+        }
     }
 
     /// Begins a new transaction.
@@ -110,7 +98,102 @@ impl Client {
 
     /// Commits a transaction.
     pub fn commit(&self) -> Result<bool> {
-        // Your code here.
-        unimplemented!()
+        //  PRE-WRITE PHASE
+        let transaction = self.transaction.as_ref().expect("transaction not found");
+        let kv_pair = &transaction.write_buffer;
+        let primary = kv_pair
+            .first()
+            .expect("cannot find the first key value pair");
+        let secondaries = &kv_pair[1..];
+        //  acquire a lock on the primary first
+        let args = PrewriteRequest {
+            timestamp: transaction.start_ts,
+            kv_pair: Some(KvPair {
+                key: primary.key.clone(),
+                value: primary.value.clone(),
+            }),
+            primary: Some(KvPair {
+                key: primary.key.clone(),
+                value: primary.value.clone(),
+            }),
+        };
+        let rpc = || self.txn_client.prewrite(&args);
+        if executor::block_on(self.call_with_retry(rpc))?.res == false {
+            return Ok(false);
+        }
+        //  acquire locks on the secondaries now
+        for kv_pair in secondaries {
+            let args = PrewriteRequest {
+                timestamp: transaction.start_ts,
+                kv_pair: Some(KvPair {
+                    key: kv_pair.key.clone(),
+                    value: kv_pair.value.clone(),
+                }),
+                primary: Some(KvPair {
+                    key: primary.key.clone(),
+                    value: primary.value.clone(),
+                }),
+            };
+            let rpc = || self.txn_client.prewrite(&args);
+            if executor::block_on(self.call_with_retry(rpc))?.res == false {
+                return Ok(false);
+            }
+        }
+        //  END PRE-WRITE PHASE
+
+        //  COMMIT PHASE
+        let commit_ts = self.get_timestamp()?;
+        assert!(
+            commit_ts > transaction.start_ts,
+            "panic because the commit ts is not strictly greater than the start ts of the txn"
+        );
+        let args = CommitRequest {
+            start_ts: transaction.start_ts,
+            commit_ts,
+            is_primary: true,
+            kv_pair: Some(KvPair {
+                key: primary.key.clone(),
+                value: primary.value.clone(),
+            }),
+        };
+        let rpc = || self.txn_client.commit(&args);
+        if executor::block_on(self.call_with_retry(rpc))?.res == false {
+            return Ok(false);
+        }
+        for kv_pair in secondaries {
+            let args = CommitRequest {
+                start_ts: transaction.start_ts,
+                commit_ts,
+                is_primary: false,
+                kv_pair: Some(KvPair {
+                    key: primary.key.clone(),
+                    value: primary.value.clone(),
+                }),
+            };
+            let rpc = || self.txn_client.commit(&args);
+            if executor::block_on(self.call_with_retry(rpc))?.res == false {
+                return Ok(false);
+            }
+        }
+        //  END COMMIT PHASE
+        Ok(true)
+    }
+
+    async fn call_with_retry<T>(
+        &self,
+        rpc: impl Fn() -> RpcFuture<labrpc::Result<T>>,
+    ) -> labrpc::Result<T> {
+        let mut attempts = 0;
+        let mut delay = Duration::from_millis(BACKOFF_TIME_MS);
+
+        for i in 0..RETRY_TIMES {
+            let result = rpc().await;
+            if result.is_ok() {
+                return result;
+            }
+            std::thread::sleep(delay);
+            delay = delay * 2;
+        }
+        return Err(labrpc::Error::Timeout);
     }
 }

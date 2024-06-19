@@ -17,7 +17,10 @@ message TimestampResponse {
     uint64 timestamp = 1;
 }
 
-message GetRequest {}
+message GetRequest {
+    uint64 timestamp = 1;
+    bytes key = 2;
+}
 
 message GetResponse {}
 
@@ -28,7 +31,8 @@ message KVPair {
 
 message PrewriteRequest {
     uint64 timestamp = 1;
-    repeated KVPair kv_pairs = 2;
+    KVPair kv_pair = 2;
+    KVPair primary = 3;
 }
 
 message PrewriteResponse {
@@ -36,7 +40,12 @@ message PrewriteResponse {
 }
 
 message CommitRequest {
-    bool is_primary = 1;
+    uint64 start_ts = 1;
+    uint64 commit_ts = 2;
+    bool is_primary = 3;
+    KVPair kv_pair = 4;
 }
 
-message CommitResponse {}
+message CommitResponse {
+    bool res = 1;
+}
