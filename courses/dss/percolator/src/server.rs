@@ -279,32 +279,24 @@ impl transaction::Service for MemoryStorage {
                 continue;
             }
 
-            let start_ts = match storage.read(
-                req.key.clone(),
-                Column::Write,
-                Some(0),
-                Some(req.timestamp),
-            ) {
-                Some(((_, commit_ts), value)) => match value {
-                    Value::Timestamp(start_ts) => start_ts,
-                    Value::Vector(_) => {
-                        return Err(labrpc::Error::Other(
-                                format!("Unexpected value of Vec<u8> where timestamp was expected in write column for key {:?} at timestamp {}", req.key, commit_ts)
-                            ));
+            let start_ts =
+                match storage.read(req.key.clone(), Column::Write, Some(0), Some(req.timestamp)) {
+                    Some(((_, commit_ts), value)) => match value {
+                        Value::Timestamp(start_ts) => start_ts,
+                        _ => {
+                            return Err(labrpc::Error::Other(format!(
+                                "unexpected value found in write columnf or key {:?} at ts {}",
+                                req.key, commit_ts
+                            )))
+                        }
+                    },
+                    None => {
+                        return Ok(GetResponse {
+                            success: false,
+                            value: Vec::new(),
+                        });
                     }
-                    Value::LockPlacedAt(_) => {
-                        return Err(labrpc::Error::Other(
-                            format!("Unexpected value of LockPlacedAt where timestamp was expected in write column for key {:?} at timestamp {}", req.key, commit_ts)
-                        ));
-                    }
-                },
-                None => {
-                    return Ok(GetResponse {
-                        success: false,
-                        value: Vec::new(),
-                    });
-                }
-            };
+                };
 
             let data = match storage.read(
                 req.key.clone(),
@@ -313,16 +305,12 @@ impl transaction::Service for MemoryStorage {
                 Some(start_ts),
             ) {
                 Some(((_, _), value)) => match value {
-                    Value::Timestamp(start_ts) => {
-                        return Err(labrpc::Error::Other(
-                            format!("Unexpected value of timestamp where Vec<u8> was expected in data column for key {:?} at timestamp {}", req.key, start_ts)
-                        ));
-                    }
                     Value::Vector(bytes) => bytes,
-                    Value::LockPlacedAt(_) => {
-                        return Err(labrpc::Error::Other(
-                            format!("Unexpected value of LockPlacedAt where Vec<u8> was expected in data column for key {:?} at timestamp {}", req.key, start_ts)
-                        ));
+                    _ => {
+                        return Err(labrpc::Error::Other(format!(
+                            "unexpected value found in data column for key {:?} at ts {}",
+                            req.key, start_ts
+                        )));
                     }
                 },
                 None => {
@@ -395,15 +383,17 @@ impl transaction::Service for MemoryStorage {
             .expect("kv_pair is missing in the commit request");
         if req.is_primary {
             //  check lock on primary still holds
-            let is_locked = storage.read(
+            match storage.read(
                 kv_pair.key.clone(),
                 Column::Lock,
                 Some(req.start_ts),
                 Some(req.start_ts),
-            );
-            if is_locked.is_none() {
-                return Ok(CommitResponse { res: false });
-            }
+            ) {
+                Some(_) => (),
+                None => {
+                    return Ok(CommitResponse { res: false });
+                }
+            };
         }
 
         //  create write and remove lock
@@ -450,6 +440,7 @@ impl MemoryStorage {
                 self.remove_lock_and_rollback(&mut storage, key, lock_start_ts);
                 return;
             }
+            return;
         }
 
         if !is_primary_lock && primary_key.is_empty() {
