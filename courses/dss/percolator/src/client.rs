@@ -4,7 +4,7 @@ use futures::executor;
 use labrpc::*;
 
 use crate::{
-    msg::{CommitRequest, KvPair, PrewriteRequest, TimestampRequest},
+    msg::{CommitRequest, GetRequest, KvPair, PrewriteRequest, TimestampRequest},
     service::{TSOClient, TransactionClient},
 };
 
@@ -30,7 +30,7 @@ pub struct Client {
     transaction: Option<Transaction>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct KVPair {
     key: Vec<u8>,
     value: Vec<u8>,
@@ -83,7 +83,14 @@ impl Client {
     /// Gets the value for a given key.
     pub fn get(&self, key: Vec<u8>) -> Result<Vec<u8>> {
         // Your code here.
-        unimplemented!()
+        let transaction = self.transaction.as_ref().expect("transaction not found");
+        let args = GetRequest {
+            timestamp: transaction.start_ts,
+            key,
+        };
+        let rpc = || self.txn_client.get(&args);
+        let result = executor::block_on(self.call_with_retry(rpc))?;
+        Ok(result.value)
     }
 
     /// Sets keys in a buffer until commit time.
@@ -157,8 +164,16 @@ impl Client {
             }),
         };
         let rpc = || self.txn_client.commit(&args);
-        if executor::block_on(self.call_with_retry(rpc))?.res == false {
-            return Ok(false);
+        match executor::block_on(self.call_with_retry(rpc)) {
+            Ok(response) => {
+                return Ok(response.res);
+            }
+            Err(e) => match e {
+                labrpc::Error::Other(e_string) if e_string == "reqhook" => {
+                    return Ok(false);
+                }
+                _ => return Err(e),
+            },
         }
         for kv_pair in secondaries {
             let args = CommitRequest {
@@ -171,8 +186,16 @@ impl Client {
                 }),
             };
             let rpc = || self.txn_client.commit(&args);
-            if executor::block_on(self.call_with_retry(rpc))?.res == false {
-                return Ok(false);
+            match executor::block_on(self.call_with_retry(rpc)) {
+                Ok(response) => return Ok(response.res),
+                Err(e) => match e {
+                    labrpc::Error::Other(e_string) => {
+                        if e_string == "reqhook" {
+                            return Ok(true);
+                        }
+                    }
+                    _ => return Err(e),
+                },
             }
         }
         //  END COMMIT PHASE
@@ -189,6 +212,9 @@ impl Client {
         for i in 0..RETRY_TIMES {
             let result = rpc().await;
             if result.is_ok() {
+                return result;
+            }
+            if result.is_err() && i == RETRY_TIMES - 1 {
                 return result;
             }
             std::thread::sleep(delay);

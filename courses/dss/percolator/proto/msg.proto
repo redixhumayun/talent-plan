@@ -22,7 +22,10 @@ message GetRequest {
     bytes key = 2;
 }
 
-message GetResponse {}
+message GetResponse {
+    bool success = 1;
+    bytes value = 2;
+}
 
 message KVPair {
     bytes key = 1;

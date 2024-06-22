@@ -61,10 +61,31 @@ impl timestamp::Service for TimestampOracle {
 // Key is a tuple (raw key, timestamp).
 pub type Key = (Vec<u8>, u64);
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq)]
 pub enum Value {
     Timestamp(u64),
     Vector(Vec<u8>),
+    LockPlacedAt(SystemTime),
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Timestamp(ts) => write!(f, "Timestamp({})", ts),
+            Value::Vector(bytes) => write!(f, "Vector({:?})", String::from_utf8_lossy(bytes)),
+            Value::LockPlacedAt(time) => write!(f, "LockPlacedAt({:?})", time),
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Timestamp(ts) => write!(f, "{}", ts),
+            Value::Vector(bytes) => write!(f, "{:?}", String::from_utf8_lossy(bytes)),
+            Value::LockPlacedAt(time) => write!(f, "{:?}", time),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +104,66 @@ pub struct KvTable {
     write: BTreeMap<Key, Value>,
     data: BTreeMap<Key, Value>,
     lock: BTreeMap<Key, Value>,
+}
+
+impl std::fmt::Display for KvTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+        // Header
+        writeln!(
+            f,
+            "{:<20} {:<20} {:<20} {:<20}",
+            "Key", "Data", "Lock", "Write"
+        )?;
+        // Separator
+        writeln!(f, "{:-<1$}", "", 80)?;
+
+        // Collect and sort all unique keys from the three maps
+        let mut all_keys = self
+            .write
+            .keys()
+            .chain(self.data.keys())
+            .chain(self.lock.keys())
+            .collect::<Vec<&Key>>();
+        all_keys.sort();
+        all_keys.reverse();
+        all_keys.dedup();
+
+        // Iterate over the keys and print values from each map
+        for key in all_keys {
+            let data_val: String = self.data.get(key).map_or("".to_string(), |v| {
+                format!(
+                    "({},{}), {}",
+                    String::from_utf8_lossy(&key.0),
+                    key.1,
+                    v.to_string()
+                )
+            });
+            let lock_val: String = self.lock.get(key).map_or("".to_string(), |v| {
+                format!(
+                    "({},{}), {}",
+                    String::from_utf8_lossy(&key.0),
+                    key.1,
+                    v.to_string()
+                )
+            });
+            let write_val: String = self.write.get(key).map_or("".to_string(), |v| {
+                format!(
+                    "({},{}), {}",
+                    String::from_utf8_lossy(&key.0),
+                    key.1,
+                    v.to_string()
+                )
+            });
+            let formatted_key = format!("{},{}", String::from_utf8_lossy(&key.0), key.1);
+            writeln!(
+                f,
+                "{:<20} {:<20} {:<20} {:<20}",
+                formatted_key, data_val, lock_val, write_val
+            )?;
+        }
+
+        Ok(())
+    }
 }
 
 impl KvTable {
@@ -170,7 +251,8 @@ impl KvTable {
             }
         }
         for key in keys_to_remove {
-            col.remove(&key);
+            let value = col.remove(&key);
+            assert!(value.is_some());
         }
     }
 }
@@ -186,36 +268,76 @@ pub struct MemoryStorage {
 impl transaction::Service for MemoryStorage {
     // example get RPC handler.
     async fn get(&self, req: GetRequest) -> labrpc::Result<GetResponse> {
-        // Your code here.
-        let start_ts = req.timestamp;
-        let key = req.key;
         loop {
             let mut storage = self.data.lock().unwrap();
-            let is_locked = storage.read(key.clone(), Column::Lock, Some(0), Some(start_ts));
-            if let Some(((conflicting_key, conflicting_ts), conflicting_value)) = is_locked {
-                if let Value::Vector(primary_key) = conflicting_value {
-                    let primary_lock =
-                        //  should the upper end be the current txn's timestamp?
-                        storage.read(primary_key.clone(), Column::Lock, Some(0), None);
-                    if primary_lock.is_none() {
-                        let latest_pk_write =
-                            storage.read(primary_key, Column::Write, Some(conflicting_ts), None);
-                        storage.erase(conflicting_key.clone(), Column::Lock, conflicting_ts);
-                        if latest_pk_write.is_none() {
-                            break;
-                        }
-                        let latest_pk_write = latest_pk_write.unwrap();
-                        storage.write(
-                            conflicting_key,
-                            Column::Write,
-                            latest_pk_write.0 .1,
-                            Value::Timestamp(conflicting_ts),
-                        );
-                    }
-                }
+            let is_row_locked =
+                storage.read(req.key.clone(), Column::Lock, Some(0), Some(req.timestamp));
+            if is_row_locked.is_some() {
+                drop(storage);
+                self.back_off_maybe_clean_up_lock(req.timestamp, req.key.clone());
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
+
+            let start_ts = match storage.read(
+                req.key.clone(),
+                Column::Write,
+                Some(0),
+                Some(req.timestamp),
+            ) {
+                Some(((_, commit_ts), value)) => match value {
+                    Value::Timestamp(start_ts) => start_ts,
+                    Value::Vector(_) => {
+                        return Err(labrpc::Error::Other(
+                                format!("Unexpected value of Vec<u8> where timestamp was expected in write column for key {:?} at timestamp {}", req.key, commit_ts)
+                            ));
+                    }
+                    Value::LockPlacedAt(_) => {
+                        return Err(labrpc::Error::Other(
+                            format!("Unexpected value of LockPlacedAt where timestamp was expected in write column for key {:?} at timestamp {}", req.key, commit_ts)
+                        ));
+                    }
+                },
+                None => {
+                    return Ok(GetResponse {
+                        success: false,
+                        value: Vec::new(),
+                    });
+                }
+            };
+
+            let data = match storage.read(
+                req.key.clone(),
+                Column::Data,
+                Some(start_ts),
+                Some(start_ts),
+            ) {
+                Some(((_, _), value)) => match value {
+                    Value::Timestamp(start_ts) => {
+                        return Err(labrpc::Error::Other(
+                            format!("Unexpected value of timestamp where Vec<u8> was expected in data column for key {:?} at timestamp {}", req.key, start_ts)
+                        ));
+                    }
+                    Value::Vector(bytes) => bytes,
+                    Value::LockPlacedAt(_) => {
+                        return Err(labrpc::Error::Other(
+                            format!("Unexpected value of LockPlacedAt where Vec<u8> was expected in data column for key {:?} at timestamp {}", req.key, start_ts)
+                        ));
+                    }
+                },
+                None => {
+                    return Err(labrpc::Error::Other(format!(
+                        "No value found in data column for key {:?} at timestamp {}",
+                        req.key, start_ts
+                    )));
+                }
+            };
+
+            return Ok(GetResponse {
+                success: true,
+                value: data,
+            });
         }
-        unimplemented!()
     }
 
     // example prewrite RPC handler.
@@ -227,14 +349,19 @@ impl transaction::Service for MemoryStorage {
             labrpc::Error::Other("kv_pair is missing in the prewrite request".to_string())
         })?;
         let mut storage = self.data.lock().unwrap();
-        let new_data = storage.read(kv_pair.key.clone(), Column::Data, Some(req.timestamp), None);
-        if new_data.is_some() {
-            return Ok(PrewriteResponse { res: false });
-        }
-        let is_locked = storage.read(kv_pair.key.clone(), Column::Lock, Some(0), None);
-        if is_locked.is_some() {
-            return Ok(PrewriteResponse { res: false });
-        }
+        match storage.read(
+            kv_pair.key.clone(),
+            Column::Write,
+            Some(req.timestamp),
+            None,
+        ) {
+            Some(_) => return Ok(PrewriteResponse { res: false }),
+            None => (),
+        };
+        match storage.read(kv_pair.key.clone(), Column::Lock, Some(0), None) {
+            Some(_) => return Ok(PrewriteResponse { res: false }),
+            None => (),
+        };
         //  all checks completed, place data and lock
         storage.write(
             kv_pair.key.clone(),
@@ -247,14 +374,14 @@ impl transaction::Service for MemoryStorage {
                 kv_pair.key.clone(),
                 Column::Lock,
                 req.timestamp,
-                Value::Timestamp(req.timestamp),
+                Value::LockPlacedAt(SystemTime::now()),
             );
         } else {
             storage.write(
                 kv_pair.key.clone(),
                 Column::Lock,
                 req.timestamp,
-                Value::Vector(kv_pair.key),
+                Value::Vector(primary.key),
             );
         }
         Ok(PrewriteResponse { res: true })
@@ -293,7 +420,90 @@ impl transaction::Service for MemoryStorage {
 
 impl MemoryStorage {
     fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: Vec<u8>) {
-        // Your code here.
-        unimplemented!()
+        //  STEPS:
+        //  1. Recheck the condition that prompted this call by re-acquiring lock. Things might have changed
+        //  2. Check if the lock is the primary lock. If secondary lock, get primary lock
+        //  3. If primary lock not present and data found in Write column, roll-forward the transaction
+        //  4. If primary lock not present and data not found in Write column, remove stale lock and continue
+        //  4. If primary lock present and expired, roll-back the transaction
+        //  5. If primary lock present and not expired, do nothing and retry after some time.
+
+        let mut storage = self.data.lock().unwrap();
+        let (mut lock_creation_time, is_primary_lock, primary_key, conflict_start_ts) =
+            match storage.read(key.clone(), Column::Lock, Some(0), Some(start_ts)) {
+                Some(((_, conflict_start_ts), value)) => match value {
+                    Value::LockPlacedAt(creation_time) => {
+                        (creation_time, true, Vec::new(), conflict_start_ts)
+                    }
+                    Value::Vector(data) => (SystemTime::UNIX_EPOCH, false, data, 0),
+                    Value::Timestamp(_) => panic!("unexpected value of bytes found in lock column"),
+                },
+                None => return,
+            };
+
+        if is_primary_lock {
+            if self
+                .check_if_primary_lock_expired(key.clone(), Value::LockPlacedAt(lock_creation_time))
+            {
+                self.remove_lock_and_rollback(&mut storage, key, conflict_start_ts);
+                return;
+            }
+        }
+
+        if !is_primary_lock && primary_key.is_empty() {
+            panic!("unexpected state: secondary lock without primary key");
+        }
+
+        if !is_primary_lock {
+            match storage.read(primary_key.clone(), Column::Lock, Some(0), Some(start_ts)) {
+                Some(((_, conflict_start_ts), value)) => {
+                    if self.check_if_primary_lock_expired(primary_key.clone(), value) {
+                        self.remove_lock_and_rollback(&mut storage, key, conflict_start_ts);
+                    }
+                }
+                None => {
+                    //  the primary lock is gone, check if there is data left behind.
+                    let primary_data = storage.read(primary_key.clone(), Column::Write, None, None);
+                    if primary_data.is_none() {
+                        // panic!(
+                        //     "primary lock removed but primary data not present for key {:?}",
+                        //     primary_key
+                        // );
+                        //  there is no data left behind, remove the stale lock on the key
+                        self.remove_lock_and_rollback(&mut storage, key, conflict_start_ts);
+                        return;
+                    }
+                    let (((_, commit_ts), start_ts)) = primary_data.unwrap();
+                    let start_ts = match start_ts {
+                        Value::Timestamp(start_ts) => start_ts,
+                        _ => panic!("unexpected value in write column"),
+                    };
+                    storage.erase(key.clone(), Column::Lock, start_ts);
+                    storage.write(key, Column::Write, commit_ts, Value::Timestamp(start_ts));
+                    return;
+                }
+            };
+            return;
+        }
+    }
+
+    fn check_if_primary_lock_expired(&self, key: Vec<u8>, value: Value) -> bool {
+        let lock_creation_time = match value {
+            Value::LockPlacedAt(creation_time) => creation_time,
+            _ => panic!("Unexpected value in lock column"),
+        };
+        let ttl_duration = Duration::from_nanos(TTL);
+        let future_time = lock_creation_time + ttl_duration;
+        future_time < SystemTime::now()
+    }
+
+    fn remove_lock_and_rollback(
+        &self,
+        storage: &mut std::sync::MutexGuard<KvTable>,
+        key: Vec<u8>,
+        timestamp: u64,
+    ) {
+        storage.erase(key.clone(), Column::Lock, timestamp);
+        storage.erase(key.clone(), Column::Data, timestamp);
     }
 }
