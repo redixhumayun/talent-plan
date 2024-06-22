@@ -423,13 +423,15 @@ impl MemoryStorage {
         //  STEPS:
         //  1. Recheck the condition that prompted this call by re-acquiring lock. Things might have changed
         //  2. Check if the lock is the primary lock. If secondary lock, get primary lock
-        //  3. If primary lock not present and data found in Write column, roll-forward the transaction
-        //  4. If primary lock not present and data not found in Write column, remove stale lock and continue
-        //  4. If primary lock present and expired, roll-back the transaction
-        //  5. If primary lock present and not expired, do nothing and retry after some time.
+        //  3. If primary lock not present and
+        //      a. Data found in Write column, roll-forward the txn
+        //      b. No data found in Write column, remove stale lock
+        //  4. If primary lock present and
+        //      a. has expired, roll-back the txn
+        //      b. has not expired, do nothing and retry after some time
 
         let mut storage = self.data.lock().unwrap();
-        let (mut lock_creation_time, is_primary_lock, primary_key, conflict_start_ts) =
+        let (mut lock_creation_time, is_primary_lock, primary_key, lock_start_ts) =
             match storage.read(key.clone(), Column::Lock, Some(0), Some(start_ts)) {
                 Some(((_, conflict_start_ts), value)) => match value {
                     Value::LockPlacedAt(creation_time) => {
@@ -445,7 +447,7 @@ impl MemoryStorage {
             if self
                 .check_if_primary_lock_expired(key.clone(), Value::LockPlacedAt(lock_creation_time))
             {
-                self.remove_lock_and_rollback(&mut storage, key, conflict_start_ts);
+                self.remove_lock_and_rollback(&mut storage, key, lock_start_ts);
                 return;
             }
         }
@@ -456,21 +458,11 @@ impl MemoryStorage {
 
         if !is_primary_lock {
             match storage.read(primary_key.clone(), Column::Lock, Some(0), Some(start_ts)) {
-                Some(((_, conflict_start_ts), value)) => {
-                    if self.check_if_primary_lock_expired(primary_key.clone(), value) {
-                        self.remove_lock_and_rollback(&mut storage, key, conflict_start_ts);
-                    }
-                }
                 None => {
                     //  the primary lock is gone, check if there is data left behind.
                     let primary_data = storage.read(primary_key.clone(), Column::Write, None, None);
                     if primary_data.is_none() {
-                        // panic!(
-                        //     "primary lock removed but primary data not present for key {:?}",
-                        //     primary_key
-                        // );
-                        //  there is no data left behind, remove the stale lock on the key
-                        self.remove_lock_and_rollback(&mut storage, key, conflict_start_ts);
+                        self.remove_lock_and_rollback(&mut storage, key, lock_start_ts);
                         return;
                     }
                     let (((_, commit_ts), start_ts)) = primary_data.unwrap();
@@ -481,6 +473,11 @@ impl MemoryStorage {
                     storage.erase(key.clone(), Column::Lock, start_ts);
                     storage.write(key, Column::Write, commit_ts, Value::Timestamp(start_ts));
                     return;
+                }
+                Some(((_, conflict_start_ts), value)) => {
+                    if self.check_if_primary_lock_expired(primary_key.clone(), value) {
+                        self.remove_lock_and_rollback(&mut storage, key, conflict_start_ts);
+                    }
                 }
             };
             return;
