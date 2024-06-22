@@ -490,8 +490,7 @@ impl MemoryStorage {
                         let start_ts = value
                             .as_timestamp()
                             .expect("unexpected value in write column, expected ts");
-                        storage.erase(key.clone(), Column::Lock, start_ts);
-                        storage.write(key, Column::Write, commit_ts, Value::Timestamp(start_ts));
+                        self.remove_lock_and_roll_forward(&mut storage, key, start_ts, commit_ts);
                     }
                 }
             }
@@ -515,5 +514,16 @@ impl MemoryStorage {
     ) {
         storage.erase(key.clone(), Column::Lock, timestamp);
         storage.erase(key.clone(), Column::Data, timestamp);
+    }
+
+    fn remove_lock_and_roll_forward(
+        &self,
+        storage: &mut std::sync::MutexGuard<KvTable>,
+        key: Vec<u8>,
+        start_ts: u64,
+        commit_ts: u64,
+    ) {
+        storage.erase(key.clone(), Column::Lock, start_ts);
+        storage.write(key, Column::Write, commit_ts, Value::Timestamp(start_ts));
     }
 }
