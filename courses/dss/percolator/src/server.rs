@@ -88,6 +88,32 @@ impl fmt::Display for Value {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueError {
+    IncorrectVariant,
+}
+
+impl Value {
+    pub fn as_lock_placed_at(&self) -> Result<SystemTime, ValueError> {
+        match self {
+            Value::LockPlacedAt(time) => Ok(*time),
+            _ => Err(ValueError::IncorrectVariant),
+        }
+    }
+    pub fn as_vector(&self) -> Result<Vec<u8>, ValueError> {
+        match self {
+            Value::Vector(key) => Ok(key.clone()),
+            _ => Err(ValueError::IncorrectVariant),
+        }
+    }
+    pub fn as_timestamp(&self) -> Result<u64, ValueError> {
+        match self {
+            Value::Timestamp(ts) => Ok(*ts),
+            _ => Err(ValueError::IncorrectVariant),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Write(Vec<u8>, Vec<u8>);
 
@@ -421,65 +447,61 @@ impl MemoryStorage {
         //      b. has not expired, do nothing and retry after some time
 
         let mut storage = self.data.lock().unwrap();
-        let (mut lock_creation_time, is_primary_lock, primary_key, lock_start_ts) =
+        let ((key, start_ts), value) =
             match storage.read(key.clone(), Column::Lock, Some(0), Some(start_ts)) {
-                Some(((_, conflict_start_ts), value)) => match value {
-                    Value::LockPlacedAt(creation_time) => {
-                        (creation_time, true, Vec::new(), conflict_start_ts)
-                    }
-                    Value::Vector(data) => (SystemTime::UNIX_EPOCH, false, data, 0),
-                    Value::Timestamp(_) => panic!("unexpected value of bytes found in lock column"),
-                },
+                Some((key, value)) => (key, value),
                 None => return,
             };
 
+        let is_primary_lock = match value {
+            Value::LockPlacedAt(creation_time) => true,
+            Value::Vector(ref data) => false,
+            Value::Timestamp(_) => panic!(
+                "unexpected value of bytes found in lock column, expected SystemTime or Vec<u8>"
+            ),
+        };
+
         if is_primary_lock {
-            if self
-                .check_if_primary_lock_expired(key.clone(), Value::LockPlacedAt(lock_creation_time))
-            {
-                self.remove_lock_and_rollback(&mut storage, key, lock_start_ts);
-                return;
+            if self.check_if_primary_lock_expired(value) {
+                self.remove_lock_and_rollback(&mut storage, key, start_ts);
             }
             return;
         }
 
-        if !is_primary_lock && primary_key.is_empty() {
-            panic!("unexpected state: secondary lock without primary key");
-        }
-
-        if !is_primary_lock {
-            match storage.read(primary_key.clone(), Column::Lock, Some(0), Some(start_ts)) {
-                None => {
-                    //  the primary lock is gone, check if there is data left behind.
-                    let primary_data = storage.read(primary_key.clone(), Column::Write, None, None);
-                    if primary_data.is_none() {
-                        self.remove_lock_and_rollback(&mut storage, key, lock_start_ts);
-                        return;
-                    }
-                    let (((_, commit_ts), start_ts)) = primary_data.unwrap();
-                    let start_ts = match start_ts {
-                        Value::Timestamp(start_ts) => start_ts,
-                        _ => panic!("unexpected value in write column"),
-                    };
-                    storage.erase(key.clone(), Column::Lock, start_ts);
-                    storage.write(key, Column::Write, commit_ts, Value::Timestamp(start_ts));
+        //  handle the secondary lock here
+        let primary_key = value
+            .as_vector()
+            .expect("unexpected value in lock column, expected Vec<u8>");
+        match storage.read(primary_key.clone(), Column::Lock, Some(0), Some(start_ts)) {
+            Some(((_, conflicting_start_ts), value)) => {
+                if self.check_if_primary_lock_expired(value) {
+                    self.remove_lock_and_rollback(&mut storage, primary_key, conflicting_start_ts);
+                    self.remove_lock_and_rollback(&mut storage, key, start_ts);
                     return;
                 }
-                Some(((_, conflict_start_ts), value)) => {
-                    if self.check_if_primary_lock_expired(primary_key.clone(), value) {
-                        self.remove_lock_and_rollback(&mut storage, key, conflict_start_ts);
+            }
+            None => {
+                //  the primary lock is gone, check for data
+                match storage.read(primary_key, Column::Write, None, None) {
+                    None => {
+                        self.remove_lock_and_rollback(&mut storage, key, start_ts);
+                    }
+                    Some(((_, commit_ts), value)) => {
+                        let start_ts = value
+                            .as_timestamp()
+                            .expect("unexpected value in write column, expected ts");
+                        storage.erase(key.clone(), Column::Lock, start_ts);
+                        storage.write(key, Column::Write, commit_ts, Value::Timestamp(start_ts));
                     }
                 }
-            };
-            return;
+            }
         }
     }
 
-    fn check_if_primary_lock_expired(&self, key: Vec<u8>, value: Value) -> bool {
-        let lock_creation_time = match value {
-            Value::LockPlacedAt(creation_time) => creation_time,
-            _ => panic!("Unexpected value in lock column"),
-        };
+    fn check_if_primary_lock_expired(&self, value: Value) -> bool {
+        let lock_creation_time = value
+            .as_lock_placed_at()
+            .expect("unexpected value in lock column, expected SystemTime");
         let ttl_duration = Duration::from_nanos(TTL);
         let future_time = lock_creation_time + ttl_duration;
         future_time < SystemTime::now()
