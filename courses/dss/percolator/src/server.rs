@@ -193,33 +193,6 @@ impl std::fmt::Display for KvTable {
 }
 
 impl KvTable {
-    // Reads the first key-value record from a specified column
-    // in MemoryStorage with a given key and a timestamp range.
-    #[inline]
-    fn read_first(
-        &self,
-        key: Vec<u8>,
-        column: Column,
-        ts_start_inclusive: Option<u64>,
-        ts_end_inclusive: Option<u64>,
-    ) -> Option<(Key, Value)> {
-        let col = match column {
-            Column::Data => &self.data,
-            Column::Lock => &self.lock,
-            Column::Write => &self.write,
-        };
-
-        for ((k, ts), value) in col.iter() {
-            if k == &key
-                && ts_start_inclusive.map_or(true, |start| *ts >= start)
-                && ts_end_inclusive.map_or(true, |end| *ts <= end)
-            {
-                return Some(((k.clone(), *ts), value.clone()));
-            }
-        }
-        None
-    }
-
     // Reads the latest key-value record from a specified column
     // in MemoryStorage with a given key and a timestamp range.
     #[inline]
@@ -439,12 +412,12 @@ impl MemoryStorage {
         //  STEPS:
         //  1. Recheck the condition that prompted this call by re-acquiring lock. Things might have changed
         //  2. Check if the lock is the primary lock. If secondary lock, get primary lock
-        //  3. If primary lock not present and
-        //      a. Data found in Write column, roll-forward the txn
-        //      b. No data found in Write column, remove stale lock
-        //  4. If primary lock present and
+        //  3. If primary lock present and
         //      a. has expired, roll-back the txn
         //      b. has not expired, do nothing and retry after some time
+        //  4. If primary lock not present and
+        //      a. Data found in Write column, roll-forward the txn
+        //      b. No data found in Write column, remove stale lock
 
         let mut storage = self.data.lock().unwrap();
         let ((key, start_ts), value) =
